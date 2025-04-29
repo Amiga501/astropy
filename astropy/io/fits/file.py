@@ -13,11 +13,12 @@ import tempfile
 import warnings
 import zipfile
 from functools import reduce
+from io import BytesIO
 
 import numpy as np
 
 # NOTE: Python can be built without bz2.
-from astropy.utils.compat.optional_deps import HAS_BZ2, HAS_LZMA, HAS_UNCOMPRESSPY
+from astropy.utils.compat.optional_deps import HAS_BZ2
 from astropy.utils.data import (
     _is_url,
     _requires_fsspec,
@@ -44,12 +45,6 @@ from .util import (
 if HAS_BZ2:
     import bz2
 
-if HAS_LZMA:
-    import lzma
-
-if HAS_UNCOMPRESSPY:
-    import uncompresspy
-
 
 # Maps astropy.io.fits-specific file mode names to the appropriate file
 # modes to use for the underlying raw files.
@@ -60,6 +55,7 @@ IO_FITS_MODES = {
     "append": "ab+",
     "ostream": "wb",
     "denywrite": "rb",
+    "buffer": "rb",
 }
 
 # Maps OS-level file modes to the appropriate astropy.io.fits specific mode
@@ -104,27 +100,11 @@ MEMMAP_MODES = {
 GZIP_MAGIC = b"\x1f\x8b\x08"
 PKZIP_MAGIC = b"\x50\x4b\x03\x04"
 BZIP2_MAGIC = b"\x42\x5a"
-LZMA_MAGIC = b"\xfd7zXZ\x00"
-LZW_MAGIC = b"\x1f\x9d"
 
 
 def _is_bz2file(fileobj):
     if HAS_BZ2:
         return isinstance(fileobj, bz2.BZ2File)
-    else:
-        return False
-
-
-def _is_lzmafile(fileobj):
-    if HAS_LZMA:
-        return isinstance(fileobj, lzma.LZMAFile)
-    else:
-        return False
-
-
-def _is_lzwfile(fileobj):
-    if HAS_UNCOMPRESSPY:
-        return isinstance(fileobj, uncompresspy.LZWFile)
     else:
         return False
 
@@ -214,7 +194,7 @@ class _File:
         # Handle raw URLs
         if (
             isinstance(fileobj, (str, bytes))
-            and mode not in ("ostream", "append", "update")
+            and mode not in ("ostream", "append", "update", "buffer")
             and _is_url(fileobj)
         ):
             self.name = download_file(fileobj, cache=cache)
@@ -223,6 +203,8 @@ class _File:
             if mode in ("ostream", "append", "update"):
                 raise ValueError(f"Mode {mode} not supported for HTTPResponse")
             fileobj = io.BytesIO(fileobj.read())
+        elif isinstance(fileobj, bytes):
+            self.name = "wip_fits"
         else:
             if isinstance(fileobj, path_like):
                 fileobj = os.path.expanduser(fileobj)
@@ -236,8 +218,10 @@ class _File:
         # Initialize the internal self._file object
         if isfile(fileobj):
             self._open_fileobj(fileobj, mode, overwrite)
-        elif isinstance(fileobj, (str, bytes)):
+        elif isinstance(fileobj, (str, bytes)) and mode not in ("buffer"):
             self._open_filename(fileobj, mode, overwrite)
+        elif isinstance(fileobj, BytesIO) and mode in ("buffer"):
+            self._open_filebuffer(fileobj, mode, overwrite)
         else:
             self._open_filelike(fileobj, mode, overwrite)
 
@@ -250,10 +234,6 @@ class _File:
             self.compression = "zip"
         elif _is_bz2file(fileobj):
             self.compression = "bzip2"
-        elif _is_lzmafile(fileobj):
-            self.compression = "lzma"
-        elif _is_lzwfile(fileobj):
-            self.compression = "lzw"
 
         if (
             self.compression is not None
@@ -269,16 +249,17 @@ class _File:
             self._file = io.BytesIO(self._file.read())
             fd.close()
 
-        if mode in ("readonly", "copyonwrite", "denywrite") or (
-            self.compression and mode == "update"
-        ):
+        if (mode in ("readonly", "copyonwrite", "denywrite", "buffer")
+                or (self.compression and mode == "update")):
             self.readonly = True
-        elif mode == "ostream" or (self.compression and mode == "append"):
+        elif (mode == "ostream"
+                  or (self.compression and mode == "append")):
             self.writeonly = True
 
         # For 'ab+' mode, the pointer is at the end after the open in
         # Linux, but is at the beginning in Solaris.
-        if mode == "ostream" or self.compression or not hasattr(self._file, "seek"):
+        if (mode == "ostream"
+                or self.compression or not hasattr(self._file, "seek")):
             # For output stream start with a truncated file.
             # For compressed files we can't really guess at the size
             self.size = 0
@@ -583,31 +564,18 @@ class _File:
             bzip2_mode = "w" if is_ostream else "r"
             self._file = bz2.BZ2File(obj_or_name, mode=bzip2_mode)
             self.compression = "bzip2"
-        elif (is_ostream and ext == ".xz") or magic.startswith(LZMA_MAGIC):
-            # Handle lzma files
-            if mode in ["update", "append"]:
-                raise OSError(
-                    "update and append modes are not supported with lzma files"
-                )
-            if not HAS_LZMA:
-                raise ModuleNotFoundError(
-                    "This Python installation does not provide the lzma module."
-                )
-            lzma_mode = "w" if is_ostream else "r"
-            self._file = lzma.LZMAFile(obj_or_name, mode=lzma_mode)
-            self.compression = "lzma"
-        elif (is_ostream and ext == ".Z") or magic.startswith(LZW_MAGIC):
-            # Handle LZW files
-            if mode in ["update", "append", "ostream"]:
-                raise OSError(f"{mode} mode not supported with LZW files")
-            if not HAS_UNCOMPRESSPY:
-                raise ModuleNotFoundError(
-                    "The optional package uncompresspy is necessary for reading"
-                    " LZW compressed files (.Z extension)."
-                )
-            self._file = uncompresspy.LZWFile(obj_or_name, mode="rb")
-            self.compression = "lzw"
         return self.compression is not None
+
+    def _open_filebuffer(self, fileobj, mode, overwrite):
+        """Open a FITS file supplied as an IO buffer"""
+        self._file = fileobj
+
+        try:
+            self._file.seek(0)
+            magic = self._file.read(4)
+            self._file.seek(0)
+        except OSError:
+            return
 
     def _open_fileobj(self, fileobj, mode, overwrite):
         """Open a FITS file from a file object (including compressed files)."""
@@ -631,7 +599,7 @@ class _File:
             # means that the current file position is at the end of the file.
             if mode in ["ostream", "append"]:
                 self._file.seek(0)
-            magic = self._file.read(6)
+            magic = self._file.read(4)
             # No matter whether the underlying file was opened with 'ab' or
             # 'ab+', we need to return to the beginning of the file in order
             # to properly process the FITS header (and handle the possibility
@@ -691,7 +659,7 @@ class _File:
 
         if os.path.exists(self.name):
             with open(self.name, "rb") as f:
-                magic = f.read(6)
+                magic = f.read(4)
         else:
             magic = b""
 
@@ -704,10 +672,7 @@ class _File:
         # Make certain we're back at the beginning of the file
         # BZ2File does not support seek when the file is open for writing, but
         # when opening a file for write, bz2.BZ2File always truncates anyway.
-        if not (
-            (_is_bz2file(self._file) or (_is_lzmafile(self._file)))
-            and mode == "ostream"
-        ):
+        if not (_is_bz2file(self._file) and mode == "ostream"):
             self._file.seek(0)
 
     @classproperty(lazy=True)
