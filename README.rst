@@ -1,3 +1,8 @@
+This branch aims to be able to load fits files from BufferIO objects directly, 
+for example, from a panel.widgets.FileDropper() item
+
+----
+
 |Astropy Logo|
 
 ----
